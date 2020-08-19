@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as glob from "glob";
-// import utimes from "utimes";
+import utimes from "utimes";
 import { ExifImage } from "exif";
 
 class Args {
@@ -51,131 +51,214 @@ class Targets {
   }
 }
 
+interface FileStat {
+  begin: Date | undefined;
+  end: Date | undefined;
+  ex_ctime: Date | undefined;
+  ctime: Date;
+  mtime: Date;
+  btime: Date;
+  invalid: boolean;
+}
+
 class FileStatsUtil {
   private constructor() {}
 
-  private static check(
-    path: string,
-    callback: (
-      ex_ctime: Date | undefined,
-      ctime: Date,
-      mtime: Date,
-      birthtime: Date,
-      modified: boolean
-    ) => void
-  ) {
-    const stats = fs.statSync(path);
-    const { ctime, mtime, birthtime } = stats;
+  private static readonly monthMatcher = RegExp(/\/(\d{4})\/(\d{4})-(\d{2})/);
+  private static readonly yearMatcher = RegExp(/\/(\d{4})\/(\d{4})-[^\d]/);
 
-    try {
-      new ExifImage({ image: path }, (error, exifData) => {
-        let ex_ctime: Date | undefined;
-        let noExif = false;
-        if (error) {
-          if (error.message === "No Exif segment found in the given image.") {
-            noExif = true;
-          } else {
-            console.error(`Error: ${path} - ${error.message}}`);
-          }
+  private static rangeFromPath(path: string): [Date, Date] | null {
+    {
+      const mm = this.monthMatcher.exec(path);
+      if (mm !== null) {
+        if (mm[1] !== mm[2]) {
+          console.error(`Year mismatch ${mm[1]} !== ${mm[2]} on ${path}`);
         } else {
-          const ex_ctime_str = exifData.exif.CreateDate;
-          if (ex_ctime_str) {
-            // YYYY:MM:DD hh:mm:ss
-            if (ex_ctime_str[4] === ":" && ex_ctime_str[7] === ":") {
-              const s = ex_ctime_str.split(":");
-              const f = `${s[0]}/${s[1]}/${s[2]}:${s[3]}:${s[4]}`;
-              ex_ctime = new Date(f);
-            }
+          const year = parseInt(mm[1], 10);
+          const month = parseInt(mm[3], 10);
+          if (year <= 1950 || year > 2030 || month < 1 || month > 12) {
+            console.error(`Invalid year or month (${year}/${month})`);
           } else {
-            noExif = true;
+            const begin = new Date(`${mm[1]}-${mm[3]}-01T00:00:00+0900`);
+            if (month === 12) {
+              const endYear = `000${year + 1}`.substr(-4);
+              const end = new Date(`${endYear}-01-01T00:00:00+0900`);
+              return [begin, end];
+            } else {
+              const endMonth = `0${month + 1}`.substr(-2);
+              const end = new Date(`${mm[1]}-${endMonth}-01T00:00:00+0900`);
+              return [begin, end];
+            }
           }
         }
-        const check1 = Math.abs(ctime.getTime() - mtime.getTime()) > 2000;
-        const check2 = Math.abs(ctime.getTime() - birthtime.getTime()) > 2000;
-        if (ex_ctime) {
-          const check3 = Math.abs(ctime.getTime() - ex_ctime.getTime()) > 2000;
-          callback(
+        return null;
+      }
+    }
+    {
+      const ym = this.yearMatcher.exec(path);
+      if (ym !== null) {
+        if (ym[1] !== ym[2]) {
+          console.error(`Year mismatch ${ym[1]} !== ${ym[2]} on ${path}`);
+        }
+        const begin = new Date(`${ym[1]}-01-01T00:00:00+0900`);
+        const year = parseInt(ym[1], 10);
+        const endYear = `000${year + 1}`.substr(-4);
+        const end = new Date(`${endYear}-01-01T00:00:00+0900`);
+        return [begin, end];
+      }
+    }
+    return null;
+  }
+
+  private static check(path: string): Promise<FileStat> {
+    return new Promise((resolve, reject) => {
+      const stats = fs.statSync(path);
+      const { ctime, mtime, birthtime } = stats;
+
+      try {
+        const range = this.rangeFromPath(path);
+        new ExifImage({ image: path }, (error, exifData) => {
+          let ex_ctime: Date | undefined;
+          let noExif = false;
+          if (error) {
+            if (error.message === "No Exif segment found in the given image.") {
+              noExif = true;
+            } else {
+              console.error(`Error: ${path} - ${error.message}}`);
+            }
+          } else {
+            const ex_ctime_str = exifData.exif.CreateDate;
+            if (ex_ctime_str) {
+              // YYYY:MM:DD hh:mm:ss
+              if (ex_ctime_str[4] === ":" && ex_ctime_str[7] === ":") {
+                const s = ex_ctime_str.split(":");
+                const f = `${s[0]}/${s[1]}/${s[2]}:${s[3]}:${s[4]}`;
+                ex_ctime = new Date(f);
+              }
+            } else {
+              noExif = true;
+            }
+          }
+          const DELTA_MAX = 10 * 1000; // 10 seconds
+          const check0 = !range || ctime < range[0] || ctime >= range[1];
+          const check1 =
+            Math.abs(ctime.getTime() - mtime.getTime()) > DELTA_MAX;
+          const check2 =
+            Math.abs(ctime.getTime() - birthtime.getTime()) > DELTA_MAX;
+
+          const r: FileStat = {
+            begin: range ? range[0] : undefined,
+            end: range ? range[1] : undefined,
             ex_ctime,
             ctime,
             mtime,
-            birthtime,
-            check1 || check2 || check3
-          );
-        } else {
-          callback(
-            undefined,
-            ctime,
-            mtime,
-            birthtime,
-            !noExif || check1 || check2
-          );
-        }
-      });
-    } catch (error) {
-      console.error(`Exception: ${path} - ${(error as Error).message}}`);
+            btime: birthtime,
+            invalid: false,
+          };
+          if (ex_ctime) {
+            const check3 =
+              Math.abs(ctime.getTime() - ex_ctime.getTime()) > DELTA_MAX;
+            r.invalid = check0 || check1 || check2 || check3;
+            return resolve(r);
+          } else {
+            r.invalid = check0 || check1 || check2 || noExif;
+            return resolve(r);
+          }
+        });
+      } catch (error) {
+        console.error(`Exception: ${path} - ${(error as Error).message}}`);
+        return reject();
+      }
+    });
+  }
+
+  private static dateFormat(date: Date | undefined): string {
+    if (!date) {
+      return "UNKNOWN";
+    } else {
+      return date.toLocaleString();
     }
   }
 
-  private static log(
-    path: string,
-    ex_ctime: Date | undefined,
-    ctime: Date,
-    mtime: Date,
-    btime: Date
-  ) {
+  private static log(path: string, fileStat: FileStat) {
     console.log(`${path}:`);
-    console.log(
-      `  ex_ctime: ${ex_ctime ? ex_ctime.toLocaleString() : "ERROR"}`
-    );
-    console.log(`  ctime: ${ctime.toLocaleString()}`);
-    console.log(`  mtime: ${mtime.toLocaleString()}`);
-    console.log(`  btime: ${btime.toLocaleString()}`);
+    console.log(`  ctime:    ${fileStat.ctime.toLocaleString()}`);
+    console.log(`  mtime:    ${fileStat.mtime.toLocaleString()}`);
+    console.log(`  btime:    ${fileStat.btime.toLocaleString()}`);
+    console.log(`  ex_ctime: ${this.dateFormat(fileStat.ex_ctime)}`);
+    console.log(`  begin:    ${this.dateFormat(fileStat.begin)}`);
+    console.log(`  end:      ${this.dateFormat(fileStat.end)}`);
   }
 
-  public static dump(path: string) {
-    this.check(path, (ex_ctime, ctime, mtime, btime, modified) => {
-      if (!modified) {
-        return;
-      }
-      this.log(path, ex_ctime, ctime, mtime, btime);
-    });
+  public static async dump(path: string): Promise<boolean> {
+    const fileInfo = await this.check(path);
+    if (!fileInfo.invalid) {
+      return false;
+    }
+    this.log(path, fileInfo);
+    return fileInfo.invalid;
   }
 
-  public static fix(path: string): void {
-    this.check(path, (ex_ctime, ctime, mtime, btime, modified) => {
-      if (!modified) {
-        return;
-      }
-      this.log(path, ex_ctime, ctime, mtime, btime);
-      if (ex_ctime) {
-        console.log(`  ctime and mtime => ${ex_ctime.toLocaleString()}`);
-        fs.utimesSync(path, ex_ctime, ex_ctime);
-        /*
-        const p = utimes(path, {
-          btime: ex_ctime.getTime(),
-        });
-        // eslint-disable-next-line @typescript-eslint/no-floating-promises
-        p.then(() => {
-          // do nothing
-        });
-        */
-      }
-    });
+  public static async fix(path: string): Promise<boolean> {
+    const fileInfo = await this.check(path);
+    if (!fileInfo.invalid) {
+      return false;
+    }
+    this.log(path, fileInfo);
+    if (fileInfo.ex_ctime) {
+      console.log(`  modified to => ${fileInfo.ex_ctime.toLocaleString()}`);
+      //fs.utimesSync(path, fileInfo.ex_ctime, fileInfo.ex_ctime);
+      const p = utimes(path, {
+        atime: fileInfo.ex_ctime.getTime(),
+        mtime: fileInfo.ex_ctime.getTime(),
+        btime: fileInfo.ex_ctime.getTime(),
+      });
+      void p.then(() => {
+        // do nothing
+      });
+      return true;
+    }
+    return false;
   }
 }
 
-const args = new Args();
-console.log(`Mode=[${args.isFix ? "Fix" : "Check"}] Target=[${args.target}]`);
+async function main(): Promise<void> {
+  const args = new Args();
+  console.log(`Mode=[${args.isFix ? "Fix" : "Check"}] Target=[${args.target}]`);
 
-const targets = Targets.get(args.target);
-targets.forEach((path) => {
-  const stat = fs.statSync(path);
-  if (!stat.isFile()) {
-    return;
+  const targets = Targets.get(args.target);
+  console.log(`${targets.length} targets...`);
+
+  let totalFiles = 0;
+  let filteredFiles = 0;
+
+  for (const path of targets) {
+    const stat = fs.statSync(path);
+    if (!stat.isFile()) {
+      continue;
+    }
+    totalFiles++;
+    if (args.isFix) {
+      const filtered = await FileStatsUtil.fix(path);
+      if (filtered) {
+        filteredFiles++;
+      }
+    } else {
+      const filtered = await FileStatsUtil.dump(path);
+      if (filtered) {
+        filteredFiles++;
+      }
+    }
   }
   if (args.isFix) {
-    FileStatsUtil.fix(path);
+    console.log(
+      `Modified ${filteredFiles} files in total ${totalFiles} files .`
+    );
   } else {
-    FileStatsUtil.dump(path);
+    console.log(
+      `Invalid ${filteredFiles} files in total ${totalFiles} files .`
+    );
   }
-});
+}
+
+void main();
