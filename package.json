@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "npx ts-node app/index.ts",
+    "dev": "ts-node app/index.ts",
+    "build": "tsc",
     "eslint": "eslint app/**/*.ts",
     "eslint:fix": "eslint --fix app/**/*.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
