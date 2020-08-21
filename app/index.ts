@@ -73,22 +73,28 @@ interface FileStat {
 class FileStatsUtil {
   private constructor() {}
 
-  private static readonly monthMatcher = RegExp(/\/(\d{4})\/(\d{4})-(\d{2})/);
+  private static readonly monthMatcher = RegExp(
+    /\/(\d{4})\/(Movies-)?(\d{4})-(\d{2})/
+  );
   private static readonly yearMatcher = RegExp(/\/(\d{4})\/(\d{4})-[^\d]/);
+  // creation_time   : 2019-03-09T11:08:48.000000Z
+  private static readonly ffmpegMatcher = RegExp(
+    /\s+creation_time\s+:\s+([-0-9:TZ.]+)/
+  );
 
   private static rangeFromPath(filePath: string): [Date, Date] | null {
     {
       const mm = this.monthMatcher.exec(filePath);
       if (mm !== null) {
-        if (mm[1] !== mm[2]) {
+        if (mm[1] !== mm[3]) {
           console.error(`Year mismatch ${mm[1]} !== ${mm[2]} on ${filePath}`);
         } else {
           const year = parseInt(mm[1], 10);
-          const month = parseInt(mm[3], 10);
+          const month = parseInt(mm[4], 10);
           if (year <= 1950 || year > 2030 || month < 1 || month > 12) {
             console.error(`Invalid year or month (${year}/${month})`);
           } else {
-            const begin = new Date(`${mm[1]}-${mm[3]}-01T00:00:00+0900`);
+            const begin = new Date(`${mm[1]}-${mm[4]}-01T00:00:00+0900`);
             if (month === 12) {
               const endYear = `000${year + 1}`.substr(-4);
               const end = new Date(`${endYear}-01-01T00:00:00+0900`);
@@ -151,6 +157,20 @@ class FileStatsUtil {
     });
   }
 
+  private static async getDateByFfmpeg(
+    filePath: string
+  ): Promise<Date | undefined> {
+    return new Promise((resolve) => {
+      exec(`ffmpeg -i "${filePath}" -dump`, (_err, _stdout, stderr) => {
+        const m = this.ffmpegMatcher.exec(stderr);
+        if (!m) {
+          return resolve(undefined);
+        }
+        return resolve(new Date(m[1]));
+      });
+    });
+  }
+
   private static async check(
     filePath: string,
     ignoreDir: boolean
@@ -159,7 +179,27 @@ class FileStatsUtil {
     const { ctime, mtime, birthtime } = stats;
 
     const range = this.rangeFromPath(filePath);
-    const meta_time = await this.getDateFromExif(filePath);
+    const extname = path.extname(filePath);
+    let meta_time: Date | undefined;
+    switch (extname.toLowerCase()) {
+      case ".jpg":
+      case ".jpeg":
+        meta_time = await this.getDateFromExif(filePath);
+        break;
+      case ".mp4":
+      case ".mov":
+        meta_time = await this.getDateByFfmpeg(filePath);
+        break;
+      default:
+        console.log(`Unknown ext [${filePath}]`);
+        break;
+    }
+    if (
+      meta_time &&
+      (meta_time.getTime() === 0 || isNaN(meta_time.getTime()))
+    ) {
+      meta_time = undefined;
+    }
 
     const r: FileStat = {
       begin: range ? range[0] : undefined,
@@ -290,13 +330,4 @@ async function main(): Promise<void> {
   }
 }
 
-exec(
-  "ffmpeg -i /Volumes/Data2/Work4/movies/IMG_1554.MP4 -dump",
-  (err, stdout, stderr) => {
-    console.log(err);
-    console.log(stderr);
-    console.log(stdout);
-  }
-);
-
-//void main();
+void main();
