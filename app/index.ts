@@ -6,6 +6,7 @@ import { ExifImage } from "exif";
 
 class Args {
   public readonly isFix: boolean;
+  public readonly ignoreDir: boolean;
   public readonly target: string;
 
   constructor() {
@@ -13,18 +14,23 @@ class Args {
     if (argv.length !== 4) {
       this.usage();
     }
-    const modeIndex = ["fix", "check"].indexOf(argv[2]);
+    const modeIndex = ["check", "check-nodir", "fix", "fix-nodir"].indexOf(
+      argv[2]
+    );
     if (modeIndex < 0) {
       this.usage();
     }
-    this.isFix = modeIndex === 0;
+    this.isFix = modeIndex >= 2;
+    this.ignoreDir = modeIndex === 1 || modeIndex === 3;
     this.target = argv[3];
   }
 
   private usage(): void {
     console.error(`${process.argv[1]} usage:`);
     console.error("  check DIR: check file/directory");
+    console.error("  check-nodir DIR: check file/directory");
     console.error("  fix DIR: fix file/directory");
+    console.error("  fix-nodir DIR: fix file/directory");
     process.exit(1);
   }
 }
@@ -112,7 +118,10 @@ class FileStatsUtil {
     return null;
   }
 
-  private static check(filePath: string): Promise<FileStat> {
+  private static check(
+    filePath: string,
+    ignoreDir: boolean
+  ): Promise<FileStat> {
     return new Promise((resolve, reject) => {
       const stats = fs.statSync(filePath);
       const { ctime, mtime, birthtime } = stats;
@@ -142,7 +151,8 @@ class FileStatsUtil {
             }
           }
           const DELTA_MAX = 10 * 1000; // 10 seconds
-          const check0 = !range || ctime < range[0] || ctime >= range[1];
+          const check0 =
+            !ignoreDir && (!range || ctime < range[0] || ctime >= range[1]);
           const check1 =
             Math.abs(ctime.getTime() - mtime.getTime()) > DELTA_MAX;
           const check2 =
@@ -157,10 +167,11 @@ class FileStatsUtil {
             btime: birthtime,
             invalid: false,
             fixable:
-              range != null &&
-              ex_ctime !== undefined &&
-              ex_ctime >= range[0] &&
-              ex_ctime < range[1],
+              ignoreDir ||
+              (range != null &&
+                ex_ctime !== undefined &&
+                ex_ctime >= range[0] &&
+                ex_ctime < range[1]),
           };
           if (ex_ctime) {
             const check3 =
@@ -197,8 +208,11 @@ class FileStatsUtil {
     console.log(`  end:      ${this.dateFormat(fileStat.end)}`);
   }
 
-  public static async dump(filePath: string): Promise<boolean> {
-    const fileInfo = await this.check(filePath);
+  public static async dump(
+    filePath: string,
+    ignoreDir: boolean
+  ): Promise<boolean> {
+    const fileInfo = await this.check(filePath, ignoreDir);
     if (!fileInfo.invalid) {
       return false;
     }
@@ -206,8 +220,11 @@ class FileStatsUtil {
     return fileInfo.invalid;
   }
 
-  public static async fix(filePath: string): Promise<boolean> {
-    const fileInfo = await this.check(filePath);
+  public static async fix(
+    filePath: string,
+    ignoreDir: boolean
+  ): Promise<boolean> {
+    const fileInfo = await this.check(filePath, ignoreDir);
     if (!fileInfo.invalid) {
       return false;
     }
@@ -246,12 +263,12 @@ async function main(): Promise<void> {
     }
     totalFiles++;
     if (args.isFix) {
-      const filtered = await FileStatsUtil.fix(filePath);
+      const filtered = await FileStatsUtil.fix(filePath, args.ignoreDir);
       if (filtered) {
         filteredFiles++;
       }
     } else {
-      const filtered = await FileStatsUtil.dump(filePath);
+      const filtered = await FileStatsUtil.dump(filePath, args.ignoreDir);
       if (filtered) {
         filteredFiles++;
       }
