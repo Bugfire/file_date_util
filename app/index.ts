@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as glob from "glob";
 import * as path from "path";
+import { exec } from "child_process";
 import utimes from "utimes";
 import { ExifImage } from "exif";
 
@@ -61,7 +62,7 @@ class Targets {
 interface FileStat {
   begin: Date | undefined;
   end: Date | undefined;
-  ex_ctime: Date | undefined;
+  meta_time: Date | undefined;
   ctime: Date;
   mtime: Date;
   btime: Date;
@@ -118,76 +119,76 @@ class FileStatsUtil {
     return null;
   }
 
-  private static check(
+  private static async getDateFromExif(
+    filePath: string
+  ): Promise<Date | undefined> {
+    return new Promise((resolve) => {
+      try {
+        new ExifImage({ image: filePath }, (error, exifData) => {
+          if (error) {
+            if (error.message !== "No Exif segment found in the given image.") {
+              console.error(`Error: ${filePath} - ${error.message}}`);
+            }
+            return resolve(undefined);
+          } else {
+            const meta_time_str = exifData.exif.CreateDate;
+            if (meta_time_str) {
+              // YYYY:MM:DD hh:mm:ss
+              if (meta_time_str[4] === ":" && meta_time_str[7] === ":") {
+                const s = meta_time_str.split(":");
+                const f = `${s[0]}/${s[1]}/${s[2]}:${s[3]}:${s[4]}`;
+                return resolve(new Date(f));
+              }
+            } else {
+              return resolve(undefined);
+            }
+          }
+        });
+      } catch (e) {
+        console.error(e);
+        resolve(undefined);
+      }
+    });
+  }
+
+  private static async check(
     filePath: string,
     ignoreDir: boolean
   ): Promise<FileStat> {
-    return new Promise((resolve, reject) => {
-      const stats = fs.statSync(filePath);
-      const { ctime, mtime, birthtime } = stats;
+    const stats = fs.statSync(filePath);
+    const { ctime, mtime, birthtime } = stats;
 
-      try {
-        const range = this.rangeFromPath(filePath);
-        new ExifImage({ image: filePath }, (error, exifData) => {
-          let ex_ctime: Date | undefined;
-          let noExif = false;
-          if (error) {
-            if (error.message === "No Exif segment found in the given image.") {
-              noExif = true;
-            } else {
-              console.error(`Error: ${filePath} - ${error.message}}`);
-            }
-          } else {
-            const ex_ctime_str = exifData.exif.CreateDate;
-            if (ex_ctime_str) {
-              // YYYY:MM:DD hh:mm:ss
-              if (ex_ctime_str[4] === ":" && ex_ctime_str[7] === ":") {
-                const s = ex_ctime_str.split(":");
-                const f = `${s[0]}/${s[1]}/${s[2]}:${s[3]}:${s[4]}`;
-                ex_ctime = new Date(f);
-              }
-            } else {
-              noExif = true;
-            }
-          }
-          const DELTA_MAX = 10 * 1000; // 10 seconds
-          const check0 =
-            !ignoreDir && (!range || ctime < range[0] || ctime >= range[1]);
-          const check1 =
-            Math.abs(ctime.getTime() - mtime.getTime()) > DELTA_MAX;
-          const check2 =
-            Math.abs(ctime.getTime() - birthtime.getTime()) > DELTA_MAX;
+    const range = this.rangeFromPath(filePath);
+    const meta_time = await this.getDateFromExif(filePath);
 
-          const r: FileStat = {
-            begin: range ? range[0] : undefined,
-            end: range ? range[1] : undefined,
-            ex_ctime,
-            ctime,
-            mtime,
-            btime: birthtime,
-            invalid: false,
-            fixable:
-              ignoreDir ||
-              (range != null &&
-                ex_ctime !== undefined &&
-                ex_ctime >= range[0] &&
-                ex_ctime < range[1]),
-          };
-          if (ex_ctime) {
-            const check3 =
-              Math.abs(ctime.getTime() - ex_ctime.getTime()) > DELTA_MAX;
-            r.invalid = check0 || check1 || check2 || check3;
-            return resolve(r);
-          } else {
-            r.invalid = check0 || check1 || check2 || noExif;
-            return resolve(r);
-          }
-        });
-      } catch (error) {
-        console.error(`Exception: ${filePath} - ${(error as Error).message}}`);
-        return reject();
-      }
-    });
+    const r: FileStat = {
+      begin: range ? range[0] : undefined,
+      end: range ? range[1] : undefined,
+      meta_time,
+      ctime,
+      mtime,
+      btime: birthtime,
+      invalid: false,
+      fixable:
+        ignoreDir ||
+        (range != null &&
+          meta_time !== undefined &&
+          meta_time >= range[0] &&
+          meta_time < range[1]),
+    };
+    if (!meta_time) {
+      r.invalid = true;
+      return r;
+    }
+    const DELTA_MAX = 10 * 1000; // 10 seconds
+    const check0 =
+      !ignoreDir && (!range || meta_time < range[0] || meta_time >= range[1]);
+    const check3 = Math.abs(meta_time.getTime() - ctime.getTime()) > DELTA_MAX;
+    const check1 = Math.abs(meta_time.getTime() - mtime.getTime()) > DELTA_MAX;
+    const check2 =
+      Math.abs(meta_time.getTime() - birthtime.getTime()) > DELTA_MAX;
+    r.invalid = check0 || check1 || check2 || check3;
+    return r;
   }
 
   private static dateFormat(date: Date | undefined): string {
@@ -203,7 +204,7 @@ class FileStatsUtil {
     console.log(`  ctime:    ${fileStat.ctime.toLocaleString()}`);
     console.log(`  mtime:    ${fileStat.mtime.toLocaleString()}`);
     console.log(`  btime:    ${fileStat.btime.toLocaleString()}`);
-    console.log(`  ex_ctime: ${this.dateFormat(fileStat.ex_ctime)}`);
+    console.log(`  meta_time:${this.dateFormat(fileStat.meta_time)}`);
     console.log(`  begin:    ${this.dateFormat(fileStat.begin)}`);
     console.log(`  end:      ${this.dateFormat(fileStat.end)}`);
   }
@@ -229,13 +230,13 @@ class FileStatsUtil {
       return false;
     }
     this.log(filePath, fileInfo);
-    if (fileInfo.fixable && fileInfo.ex_ctime) {
-      console.log(`  modified to => ${fileInfo.ex_ctime.toLocaleString()}`);
-      fs.utimesSync(filePath, fileInfo.ex_ctime, fileInfo.ex_ctime);
+    if (fileInfo.fixable && fileInfo.meta_time) {
+      console.log(`  modified to => ${fileInfo.meta_time.toLocaleString()}`);
+      fs.utimesSync(filePath, fileInfo.meta_time, fileInfo.meta_time);
       await utimes(filePath, {
-        atime: fileInfo.ex_ctime.getTime(),
-        mtime: fileInfo.ex_ctime.getTime(),
-        btime: fileInfo.ex_ctime.getTime(),
+        atime: fileInfo.meta_time.getTime(),
+        mtime: fileInfo.meta_time.getTime(),
+        btime: fileInfo.meta_time.getTime(),
       });
       return true;
     }
@@ -289,4 +290,13 @@ async function main(): Promise<void> {
   }
 }
 
-void main();
+exec(
+  "ffmpeg -i /Volumes/Data2/Work4/movies/IMG_1554.MP4 -dump",
+  (err, stdout, stderr) => {
+    console.log(err);
+    console.log(stderr);
+    console.log(stdout);
+  }
+);
+
+//void main();
