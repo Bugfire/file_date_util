@@ -5,6 +5,8 @@ import { exec } from "child_process";
 import utimes from "utimes";
 import { ExifImage } from "exif";
 
+type FileFlag = "normal" | "no_meta" | "fixable";
+
 class Args {
   public readonly isFix: boolean;
   public readonly ignoreDir: boolean;
@@ -66,8 +68,8 @@ interface FileStat {
   ctime: Date;
   mtime: Date;
   btime: Date;
-  invalid: boolean;
-  fixable: boolean;
+  flag: FileFlag;
+  validDir: boolean;
 }
 
 class FileStatsUtil {
@@ -137,13 +139,21 @@ class FileStatsUtil {
             }
             return resolve(undefined);
           } else {
-            const meta_time_str = exifData.exif.CreateDate;
+            let meta_time_str = exifData.exif.CreateDate;
+            if (!meta_time_str || meta_time_str.indexOf(":") < 0) {
+              meta_time_str = exifData.exif.DateTimeOriginal;
+            }
             if (meta_time_str) {
               // YYYY:MM:DD hh:mm:ss
               if (meta_time_str[4] === ":" && meta_time_str[7] === ":") {
                 const s = meta_time_str.split(":");
                 const f = `${s[0]}/${s[1]}/${s[2]}:${s[3]}:${s[4]}`;
                 return resolve(new Date(f));
+              } else {
+                console.error(
+                  `Error: ${filePath} - Invalid date format ${meta_time_str}`
+                );
+                return resolve(undefined);
               }
             } else {
               return resolve(undefined);
@@ -188,6 +198,9 @@ class FileStatsUtil {
         break;
       case ".mp4":
       case ".mov":
+      case ".mts":
+      case ".m2ts":
+      case ".avi":
         meta_time = await this.getDateByFfmpeg(filePath);
         break;
       default:
@@ -208,8 +221,8 @@ class FileStatsUtil {
       ctime,
       mtime,
       btime: birthtime,
-      invalid: false,
-      fixable:
+      flag: "normal",
+      validDir:
         ignoreDir ||
         (range != null &&
           meta_time !== undefined &&
@@ -217,7 +230,7 @@ class FileStatsUtil {
           meta_time < range[1]),
     };
     if (!meta_time) {
-      r.invalid = true;
+      r.flag = "no_meta";
       return r;
     }
     const DELTA_MAX = 10 * 1000; // 10 seconds
@@ -227,7 +240,11 @@ class FileStatsUtil {
     const check1 = Math.abs(meta_time.getTime() - mtime.getTime()) > DELTA_MAX;
     const check2 =
       Math.abs(meta_time.getTime() - birthtime.getTime()) > DELTA_MAX;
-    r.invalid = check0 || check1 || check2 || check3;
+    if (check0 || check1 || check2 || check3) {
+      r.flag = "fixable";
+    } else {
+      r.flag = "normal";
+    }
     return r;
   }
 
@@ -252,13 +269,16 @@ class FileStatsUtil {
   public static async dump(
     filePath: string,
     ignoreDir: boolean
-  ): Promise<boolean> {
+  ): Promise<FileFlag> {
     const fileInfo = await this.check(filePath, ignoreDir);
-    if (!fileInfo.invalid) {
-      return false;
+    if (!fileInfo.meta_time) {
+      console.log(`${filePath}: NO Meta data!`);
+    }
+    if (fileInfo.flag !== "fixable") {
+      return fileInfo.flag;
     }
     this.log(filePath, fileInfo);
-    return fileInfo.invalid;
+    return fileInfo.flag;
   }
 
   public static async fix(
@@ -266,21 +286,22 @@ class FileStatsUtil {
     ignoreDir: boolean
   ): Promise<boolean> {
     const fileInfo = await this.check(filePath, ignoreDir);
-    if (!fileInfo.invalid) {
+    if (
+      fileInfo.flag !== "fixable" ||
+      !fileInfo.validDir ||
+      !fileInfo.meta_time
+    ) {
       return false;
     }
     this.log(filePath, fileInfo);
-    if (fileInfo.fixable && fileInfo.meta_time) {
-      console.log(`  modified to => ${fileInfo.meta_time.toLocaleString()}`);
-      fs.utimesSync(filePath, fileInfo.meta_time, fileInfo.meta_time);
-      await utimes(filePath, {
-        atime: fileInfo.meta_time.getTime(),
-        mtime: fileInfo.meta_time.getTime(),
-        btime: fileInfo.meta_time.getTime(),
-      });
-      return true;
-    }
-    return false;
+    console.log(`  modified to => ${fileInfo.meta_time.toLocaleString()}`);
+    fs.utimesSync(filePath, fileInfo.meta_time, fileInfo.meta_time);
+    await utimes(filePath, {
+      atime: fileInfo.meta_time.getTime(),
+      mtime: fileInfo.meta_time.getTime(),
+      btime: fileInfo.meta_time.getTime(),
+    });
+    return true;
   }
 }
 
@@ -289,42 +310,62 @@ async function main(): Promise<void> {
   console.log(`Mode=[${args.isFix ? "Fix" : "Check"}] Target=[${args.target}]`);
 
   const targets = Targets.get(args.target);
-  console.log(`${targets.length} files...`);
+  console.log(`Checking ${targets.length} files...`);
 
   let totalFiles = 0;
-  let filteredFiles = 0;
 
-  for (const filePath of targets) {
-    const stat = fs.statSync(filePath);
-    if (!stat.isFile()) {
-      continue;
-    }
-    if (path.basename(filePath) === "Picasa.ini") {
-      continue;
-    }
-    totalFiles++;
-    if (args.isFix) {
-      const filtered = await FileStatsUtil.fix(filePath, args.ignoreDir);
-      if (filtered) {
-        filteredFiles++;
+  if (args.isFix) {
+    let fixedFiles = 0;
+    for (const filePath of targets) {
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile()) {
+        continue;
       }
+      if (path.basename(filePath) === "Picasa.ini") {
+        continue;
+      }
+      totalFiles++;
+      const fixed = await FileStatsUtil.fix(filePath, args.ignoreDir);
+      if (fixed) {
+        fixedFiles++;
+      }
+    }
+    if (fixedFiles === 0) {
+      console.log("no fixable files");
     } else {
-      const filtered = await FileStatsUtil.dump(filePath, args.ignoreDir);
-      if (filtered) {
-        filteredFiles++;
-      }
-    }
-  }
-  if (filteredFiles === 0) {
-    console.log("no target files");
-  } else {
-    if (args.isFix) {
       console.log(
-        `Modified ${filteredFiles} files in total ${totalFiles} files .`
+        `Modified ${fixedFiles} files in total ${totalFiles} files .`
       );
+    }
+  } else {
+    let fixableFiles = 0;
+    let noMetaFiles = 0;
+    for (const filePath of targets) {
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile()) {
+        continue;
+      }
+      if (path.basename(filePath) === "Picasa.ini") {
+        continue;
+      }
+      totalFiles++;
+      const flag = await FileStatsUtil.dump(filePath, args.ignoreDir);
+      switch (flag) {
+        case "fixable":
+          fixableFiles++;
+          break;
+        case "no_meta":
+          noMetaFiles++;
+          break;
+        case "normal":
+          break;
+      }
+    }
+    if (fixableFiles === 0 && noMetaFiles === 0) {
+      console.log("no fixable files");
     } else {
       console.log(
-        `Invalid ${filteredFiles} files in total ${totalFiles} files .`
+        `No-meta ${noMetaFiles} files and Fixable ${fixableFiles} in total ${totalFiles} files .`
       );
     }
   }
